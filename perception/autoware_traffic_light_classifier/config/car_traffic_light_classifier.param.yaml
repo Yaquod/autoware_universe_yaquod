@@ -2,8 +2,8 @@
   ros__parameters:
     approximate_sync: false
     precision: fp16
-    mean: [123.675, 116.28, 103.53]
-    std: [58.395, 57.12, 57.375]
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
     over_exposure_threshold: 0.85
     under_exposure_threshold: -0.83
     classifier_type: 1
