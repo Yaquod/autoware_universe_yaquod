@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "map_based_prediction/data_structure.hpp"
-#include "map_based_prediction/path_generator.hpp"
+#include "autoware/map_based_prediction/data_structure.hpp"
+#include "autoware/map_based_prediction/path_generator/path_generator.hpp"
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 using autoware_perception_msgs::msg::ObjectClassification;

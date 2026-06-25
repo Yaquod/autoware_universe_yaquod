@@ -55,11 +55,6 @@
           "default": 0.0,
           "description": "If positive value is specified, the value of each layer output will be clipped between [0.0, clip_value]. This option is valid only when precision==int8 and used to manually specify the dynamic range instead of using any calibration."
         },
-        "preprocess_on_gpu": {
-          "type": "boolean",
-          "default": true,
-          "description": "If true, pre-processing is performed on GPU."
-        },
         "gpu_id": {
           "type": "integer",
           "default": 0,
@@ -70,7 +65,7 @@
           "default": "",
           "description": "Path to a file which contains path to images. Those images will be used for int8 quantization."
         },
-        "is_roi_overlap_segment": {
+        "is_roi_overlap_segmentation": {
           "type": "boolean",
           "description": "Refine segmentation by overlaying ROI class."
         },
@@ -82,7 +77,7 @@
           "type": "boolean",
           "description": "Publish color mask for result visualization."
         },
-        "roi_overlay_segment_label": {
+        "roi_overlay_segmentation_label": {
           "type": "object",
           "description": "Enable/disable ROI overlay for specific labels.",
           "additionalProperties": {
@@ -100,13 +95,12 @@
         "quantize_last_layer",
         "profile_per_layer",
         "clip_value",
-        "preprocess_on_gpu",
         "gpu_id",
         "calibration_image_list_path",
-        "is_roi_overlap_segment",
+        "is_roi_overlap_segmentation",
         "overlap_roi_score_threshold",
         "is_publish_color_mask",
-        "roi_overlay_segment_label"
+        "roi_overlay_segmentation_label"
       ],
       "additionalProperties": false
     }

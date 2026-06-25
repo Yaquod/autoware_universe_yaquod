@@ -17,7 +17,11 @@ import threading
 
 from autoware_vehicle_msgs.msg import ControlModeReport
 from autoware_vehicle_msgs.msg import GearReport
+from autoware_vehicle_msgs.msg import HazardLightsCommand
+from autoware_vehicle_msgs.msg import HazardLightsReport
 from autoware_vehicle_msgs.msg import SteeringReport
+from autoware_vehicle_msgs.msg import TurnIndicatorsCommand
+from autoware_vehicle_msgs.msg import TurnIndicatorsReport
 from autoware_vehicle_msgs.msg import VelocityReport
 from builtin_interfaces.msg import Time
 import carla
@@ -38,6 +42,7 @@ from transforms3d.euler import euler2quat
 # New modular sensor infrastructure
 from .modules import ROSPublisherManager
 from .modules import SensorKitLoader
+from .modules import SensorPublishWorker
 from .modules import SensorRegistry
 from .modules.carla_data_provider import GameTime
 from .modules.carla_utils import carla_location_to_ros_point
@@ -91,10 +96,12 @@ class carla_ros2_interface(object):
         self.tf_listener = None
 
     def _initialize_status_publishers(self):
-        """Initialize all vehicle status publishers.
+        """
+        Initialize all vehicle status publishers.
 
         Note: GNSS pose publisher is now managed via sensor registry.
         Only vehicle status publishers are created here.
+
         """
         self.pub_vel_state = self.ros2_node.create_publisher(
             VelocityReport, "/vehicle/status/velocity_status", 1
@@ -111,6 +118,12 @@ class carla_ros2_interface(object):
         self.pub_actuation_status = self.ros2_node.create_publisher(
             ActuationStatusStamped, "/vehicle/status/actuation_status", 1
         )
+        self.pub_turn_indicators_state = self.ros2_node.create_publisher(
+            TurnIndicatorsReport, "/vehicle/status/turn_indicators_status", 1
+        )
+        self.pub_hazard_lights_state = self.ros2_node.create_publisher(
+            HazardLightsReport, "/vehicle/status/hazard_lights_status", 1
+        )
 
     def _initialize_subscriptions(self):
         """Initialize all ROS 2 subscriptions."""
@@ -119,6 +132,18 @@ class carla_ros2_interface(object):
         )
         self.sub_vehicle_initialpose = self.ros2_node.create_subscription(
             PoseWithCovarianceStamped, "initialpose", self.initialpose_callback, 1
+        )
+        self.sub_turn_indicators = self.ros2_node.create_subscription(
+            TurnIndicatorsCommand,
+            "/control/command/turn_indicators_cmd",
+            self.turn_indicators_callback,
+            1,
+        )
+        self.sub_hazard_lights = self.ros2_node.create_subscription(
+            HazardLightsCommand,
+            "/control/command/hazard_lights_cmd",
+            self.hazard_lights_callback,
+            1,
         )
         self.current_control = carla.VehicleControl()
 
@@ -130,7 +155,8 @@ class carla_ros2_interface(object):
         mapping_file = self.param_values.get("sensor_mapping_file", "")
         if not self.sensor_loader.load_sensor_mapping(mapping_file):
             raise FileNotFoundError(
-                "Unable to locate sensor mapping YAML. Provide --ros-args -p sensor_mapping_file:=<path>"
+                "Unable to locate sensor mapping YAML. "
+                "Provide --ros-args -p sensor_mapping_file:=<path>"
             )
 
         sensor_kit_name = self._resolve_sensor_kit_name()
@@ -146,7 +172,8 @@ class carla_ros2_interface(object):
 
         if not self.sensor_configs:
             raise RuntimeError(
-                "Sensor mapping produced zero sensors. Check enabled_sensors list and calibration files."
+                "Sensor mapping produced zero sensors. "
+                "Check enabled_sensors list and calibration files."
             )
 
         self._register_sensor_configs(self.sensor_configs)
@@ -268,9 +295,17 @@ class carla_ros2_interface(object):
         self.ego_actor = None
         self.physics_control = None
         self.current_control = carla.VehicleControl()
+        self.current_turn_indicator = TurnIndicatorsCommand.DISABLE
+        self.current_hazard_lights = HazardLightsCommand.DISABLE
 
         # Thread synchronization (protects: current_control, ego_actor, timestamp, physics_control)
         self._state_lock = threading.Lock()
+
+        # Per-sensor publish workers keyed by sensor ID. Heavy sensor data
+        # (camera, lidar) is converted and published on these threads so the
+        # synchronous tick loop is never blocked by serialization or by
+        # reliable-QoS flow control (see SensorPublishWorker).
+        self._publish_workers = {}
 
         # ROS-related helpers initialized later
         self.ros2_node = None
@@ -289,11 +324,13 @@ class carla_ros2_interface(object):
         return self.param_values
 
     def checkFrequency(self, sensor):
-        """Return True when publication should be throttled for the sensor.
+        """
+        Return True when publication should be throttled for the sensor.
 
-        Uses simulation time (self.timestamp) for all sensors to ensure correct
-        throttling in synchronous mode. Wall-clock timing would cause issues when
-        simulation speed differs from real-time.
+        Uses simulation time (self.timestamp) for all sensors to ensure correct throttling in
+        synchronous mode. Wall-clock timing would cause issues when simulation speed differs from
+        real-time.
+
         """
         # Use sensor registry for all sensors (including legacy ones)
         config = self.sensor_registry.get_sensor(sensor)
@@ -306,26 +343,50 @@ class carla_ros2_interface(object):
         should_publish = self.sensor_registry.should_publish(sensor, self.timestamp)
         return not should_publish
 
-    def get_msg_header(self, frame_id):
-        """Obtain and modify ROS message header."""
+    def get_msg_header(self, frame_id, timestamp=None):
+        """Obtain and modify ROS message header.
+
+        timestamp defaults to the latest tick time; publish workers pass the
+        timestamp captured when their frame was enqueued so messages are
+        stamped with the frame's own tick even when published later.
+        """
         header = Header()
         header.frame_id = frame_id
-        seconds = int(self.timestamp)
-        nanoseconds = int((self.timestamp - int(self.timestamp)) * 1000000000.0)
+        if timestamp is None:
+            timestamp = self.timestamp
+        seconds = int(timestamp)
+        nanoseconds = int((timestamp - int(timestamp)) * 1000000000.0)
         header.stamp = Time(sec=seconds, nanosec=nanoseconds)
         return header
 
-    def lidar(self, carla_lidar_measurement, id_):
-        """Transform the received lidar measurement into a ROS point cloud message."""
-        if self.checkFrequency(id_):
-            return
+    def _submit_to_publish_worker(self, key, fn, *args):
+        """Run a publish call on the sensor's worker thread (created lazily)."""
+        worker = self._publish_workers.get(key)
+        if worker is None:
+            worker = SensorPublishWorker(key, self.logger)
+            self._publish_workers[key] = worker
+        worker.submit(fn, args)
 
+    def lidar(self, carla_lidar_measurement, id_, timestamp=None):
+        """Transform the received lidar measurement into a ROS point cloud message.
+
+        Runs on the sensor's publish worker thread; frequency gating and
+        registry bookkeeping happen at the dispatch site in run_step.
+        """
         config = self.sensor_registry.get_sensor(id_)
         if not config:
             self.logger.warning(f"No registry entry for LiDAR sensor '{id_}'")
             return
 
-        header = self.get_msg_header(frame_id=config.frame_id or "base_link")
+        publisher = self.pub_lidar.get(id_)
+        if publisher is None:
+            self.logger.warning(f"LiDAR publisher missing for '{id_}'")
+            return
+        # Skip the conversion work when nothing consumes this point cloud.
+        if publisher.get_subscription_count() == 0:
+            return
+
+        header = self.get_msg_header(frame_id=config.frame_id or "base_link", timestamp=timestamp)
         fields = [
             PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
@@ -377,13 +438,7 @@ class carla_ros2_interface(object):
         structured_lidar_data["channel"] = lidar_data[:, 5].astype(numpy.uint16)
 
         point_cloud_msg = create_cloud(header, fields, structured_lidar_data)
-        publisher = self.pub_lidar.get(id_)
-        if publisher is None:
-            self.logger.warning(f"LiDAR publisher missing for '{id_}'")
-            return
-
         publisher.publish(point_cloud_msg)
-        self.sensor_registry.update_sensor_timestamp(id_, self.timestamp)
 
     def initialpose_callback(self, data):
         """Transform RVIZ initial pose to CARLA (thread-safe)."""
@@ -499,42 +554,51 @@ class carla_ros2_interface(object):
 
         return camera_info
 
-    def camera(self, carla_camera_data, cam_id):
-        """Handle multiple cameras with dynamic routing by sensor ID."""
+    def camera(self, carla_camera_data, cam_id, timestamp=None):
+        """Handle multiple cameras with dynamic routing by sensor ID.
+
+        Runs on the sensor's publish worker thread; frequency gating and
+        registry bookkeeping happen at the dispatch site in run_step.
+        """
         config = self.sensor_registry.get_sensor(cam_id)
         if not config:
             self.logger.warning(f"No registry entry for camera '{cam_id}'")
             return
 
+        # Converting and publishing a multi-megabyte image is expensive even
+        # off the tick thread (GIL pressure from several workers starves it).
+        # Skip the work entirely when nothing consumes this camera; checked
+        # per frame so late subscribers start receiving immediately.
+        img_pub = self.pub_camera.get(cam_id)
+        info_pub = self.pub_camera_info.get(cam_id)
+        has_image_subs = img_pub is not None and img_pub.get_subscription_count() > 0
+        has_info_subs = info_pub is not None and info_pub.get_subscription_count() > 0
+        if not has_image_subs and not has_info_subs:
+            return
+
         if cam_id not in self.camera_info_cache:
             self.camera_info_cache[cam_id] = self._build_camera_info(carla_camera_data)
 
-        if self.checkFrequency(cam_id):
-            return
-
-        # Create image message
-        image_array = numpy.ndarray(
-            shape=(carla_camera_data.height, carla_camera_data.width, 4),
-            dtype=numpy.uint8,
-            buffer=carla_camera_data.raw_data,
-        )
-        img_msg = self.cv_bridge.cv2_to_imgmsg(image_array, encoding="bgra8")
-        img_msg.header = self.get_msg_header(
-            frame_id=config.frame_id or f"{cam_id}/camera_optical_link"
+        header = self.get_msg_header(
+            frame_id=config.frame_id or f"{cam_id}/camera_optical_link", timestamp=timestamp
         )
 
         # Publish camera info
-        cam_info = self.camera_info_cache[cam_id]
-        cam_info.header = img_msg.header
-        info_pub = self.pub_camera_info.get(cam_id)
-        if info_pub:
+        if has_info_subs:
+            cam_info = self.camera_info_cache[cam_id]
+            cam_info.header = header
             info_pub.publish(cam_info)
 
         # Publish image
-        img_pub = self.pub_camera.get(cam_id)
-        if img_pub:
+        if has_image_subs:
+            image_array = numpy.ndarray(
+                shape=(carla_camera_data.height, carla_camera_data.width, 4),
+                dtype=numpy.uint8,
+                buffer=carla_camera_data.raw_data,
+            )
+            img_msg = self.cv_bridge.cv2_to_imgmsg(image_array, encoding="bgra8")
+            img_msg.header = header
             img_pub.publish(img_msg)
-            self.sensor_registry.update_sensor_timestamp(cam_id, self.timestamp)
 
     def imu(self, carla_imu_measurement):
         """Transform and publish IMU measurement to ROS."""
@@ -573,11 +637,13 @@ class carla_ros2_interface(object):
             self.logger.warning("IMU publisher not initialized")
 
     def first_order_steering(self, steer_input):
-        """First order steering model.
+        """
+        First order steering model.
 
         Gracefully handles:
         - Early control commands before first simulation tick (returns raw input)
         - Multiple commands in same CARLA tick (preserves filter state, no zero spike)
+
         """
         # Guard against control commands arriving before first sensor callback
         if self.timestamp is None:
@@ -605,9 +671,11 @@ class carla_ros2_interface(object):
         return steer_output
 
     def control_callback(self, in_cmd):
-        """Convert and publish CARLA Ego Vehicle Control to AUTOWARE.
+        """
+        Convert and publish CARLA Ego Vehicle Control to AUTOWARE.
 
         Thread-safe: Acquires state lock when accessing shared vehicle state.
+
         """
         out_cmd = carla.VehicleControl()
         out_cmd.throttle = in_cmd.actuation.accel_cmd
@@ -626,10 +694,51 @@ class carla_ros2_interface(object):
             out_cmd.brake = in_cmd.actuation.brake_cmd
             self.current_control = out_cmd
 
+    def turn_indicators_callback(self, in_cmd):
+        """Store turn indicator command (thread-safe)."""
+        with self._state_lock:
+            self.current_turn_indicator = in_cmd.command
+
+    def hazard_lights_callback(self, in_cmd):
+        """Store hazard lights command (thread-safe)."""
+        with self._state_lock:
+            self.current_hazard_lights = in_cmd.command
+
+    def apply_light_state(self):
+        """
+        Apply turn indicator and hazard lights commands to CARLA ego vehicle.
+
+        Hazard takes priority over turn indicator. Other light bits (brake,
+        reverse, headlights, etc.) are preserved so we do not interfere with
+        anything CARLA or another module manages.
+
+        """
+        with self._state_lock:
+            if not self.ego_actor:
+                return
+            turn_cmd = self.current_turn_indicator
+            hazard_cmd = self.current_hazard_lights
+            current_state = int(self.ego_actor.get_light_state())
+
+            left_bit = int(carla.VehicleLightState.LeftBlinker)
+            right_bit = int(carla.VehicleLightState.RightBlinker)
+
+            new_state = current_state & ~left_bit & ~right_bit
+            if hazard_cmd == HazardLightsCommand.ENABLE:
+                new_state |= left_bit | right_bit
+            elif turn_cmd == TurnIndicatorsCommand.ENABLE_LEFT:
+                new_state |= left_bit
+            elif turn_cmd == TurnIndicatorsCommand.ENABLE_RIGHT:
+                new_state |= right_bit
+
+            self.ego_actor.set_light_state(carla.VehicleLightState(new_state))
+
     def ego_status(self):
-        """Publish ego vehicle status.
+        """
+        Publish ego vehicle status.
 
         Thread-safe: Acquires state lock when accessing ego_actor.
+
         """
         if self.checkFrequency("status"):
             return
@@ -644,6 +753,7 @@ class carla_ros2_interface(object):
             ego_angular_velocity = self.ego_actor.get_angular_velocity()
             steer_angle = self.ego_actor.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel)
             control = self.ego_actor.get_control()
+            light_state = int(self.ego_actor.get_light_state())
 
         # convert velocity from cartesian to ego frame
         trans_mat = numpy.array(ego_transform.get_matrix()).reshape(4, 4)
@@ -679,27 +789,58 @@ class carla_ros2_interface(object):
         out_actuation_status.status.brake_status = control.brake
         out_actuation_status.status.steer_status = -control.steer
 
+        # Decode CARLA blinker bits into Autoware turn-indicator / hazard reports.
+        left_on = bool(light_state & int(carla.VehicleLightState.LeftBlinker))
+        right_on = bool(light_state & int(carla.VehicleLightState.RightBlinker))
+
+        out_turn_indicators_state = TurnIndicatorsReport()
+        out_turn_indicators_state.stamp = out_vel_state.header.stamp
+        if left_on and right_on:
+            # Both blinkers on => hazard mode; turn indicator reports DISABLE.
+            out_turn_indicators_state.report = TurnIndicatorsReport.DISABLE
+        elif left_on:
+            out_turn_indicators_state.report = TurnIndicatorsReport.ENABLE_LEFT
+        elif right_on:
+            out_turn_indicators_state.report = TurnIndicatorsReport.ENABLE_RIGHT
+        else:
+            out_turn_indicators_state.report = TurnIndicatorsReport.DISABLE
+
+        out_hazard_lights_state = HazardLightsReport()
+        out_hazard_lights_state.stamp = out_vel_state.header.stamp
+        if left_on and right_on:
+            out_hazard_lights_state.report = HazardLightsReport.ENABLE
+        else:
+            out_hazard_lights_state.report = HazardLightsReport.DISABLE
+
         self.pub_actuation_status.publish(out_actuation_status)
         self.pub_vel_state.publish(out_vel_state)
         self.pub_steering_state.publish(out_steering_state)
         self.pub_ctrl_mode.publish(out_ctrl_mode)
         self.pub_gear_state.publish(out_gear_state)
+        self.pub_turn_indicators_state.publish(out_turn_indicators_state)
+        self.pub_hazard_lights_state.publish(out_hazard_lights_state)
         self.sensor_registry.update_sensor_timestamp("status", self.timestamp)
 
     def run_step(self, input_data, timestamp):
-        """Execute main simulation step for publishing sensor data and getting control commands.
+        """
+        Execute main simulation step for publishing sensor data and getting control commands.
 
         Thread-safe: Acquires state lock when writing timestamp and reading current_control.
-        The timestamp must be protected because control_callback reads it (via first_order_steering)
-        to calculate dt. Without protection, the ROS callback could see a partially-updated or
-        future timestamp, yielding negative/zero dt and unstable steering.
+        The timestamp must be protected because control_callback reads it (via
+        first_order_steering) to calculate dt. Without protection, the ROS callback could
+        see a partially-updated or future timestamp, yielding negative/zero dt and unstable
+        steering.
 
-        Args:
+        Args
+        ----
             input_data: Dictionary of sensor data from CARLA
             timestamp: Current simulation timestamp
 
-        Returns:
+        Returns
+        -------
             carla.VehicleControl: Current control command for the vehicle
+
+
         """
         # Update timestamp under lock to prevent race with control_callback
         with self._state_lock:
@@ -722,16 +863,29 @@ class carla_ros2_interface(object):
                 )
                 continue
 
+            # Camera and lidar conversion/publishing run on per-sensor worker
+            # threads: publishing multi-megabyte messages inline (reliable-QoS
+            # camera images in particular block on DDS flow control) would
+            # stall this loop and slow simulation time itself. Frequency
+            # gating and registry bookkeeping stay on this thread so the
+            # registry is never accessed concurrently.
             if sensor_type == "sensor.camera.rgb":
-                self.camera(data[1], key)  # Pass sensor ID for multi-camera support
+                if not self.checkFrequency(key):
+                    self.sensor_registry.update_sensor_timestamp(key, self.timestamp)
+                    self._submit_to_publish_worker(key, self.camera, data[1], key, self.timestamp)
             elif sensor_type == "sensor.other.gnss":
                 self.pose()
             elif sensor_type == "sensor.lidar.ray_cast":
-                self.lidar(data[1], key)
+                if not self.checkFrequency(key):
+                    self.sensor_registry.update_sensor_timestamp(key, self.timestamp)
+                    self._submit_to_publish_worker(key, self.lidar, data[1], key, self.timestamp)
             elif sensor_type == "sensor.other.imu":
                 self.imu(data[1])
             else:
                 self.logger.debug(f"No publisher for sensor '{key}' (type={sensor_type})")
+
+        # Push turn indicator / hazard lights to CARLA before reading status back.
+        self.apply_light_state()
 
         # Publish ego vehicle status
         self.ego_status()
@@ -741,11 +895,18 @@ class carla_ros2_interface(object):
             return self.current_control
 
     def shutdown(self):
-        """Clean shutdown of ROS node and spin thread.
-
-        Properly destroys publishers, stops the spin thread, and shuts down rclpy
-        to prevent process hanging and publisher leaks.
         """
+        Clean shutdown of ROS node and spin thread.
+
+        Properly destroys publishers, stops the spin thread, and shuts down rclpy to prevent
+        process hanging and publisher leaks.
+
+        """
+        # Stop publish workers before destroying the publishers they use
+        for worker in self._publish_workers.values():
+            worker.stop()
+        self._publish_workers.clear()
+
         # Destroy publishers first
         if self.ros_publisher_manager:
             self.ros_publisher_manager.destroy_all_publishers()

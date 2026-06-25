@@ -63,19 +63,25 @@ if(TRT_AVAIL AND CUDA_AVAIL)
 
   # cSpell:ignore expt
   list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr -diag-suppress 1675 --extended-lambda")
+  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_75,code=sm_75")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_86,code=sm_86")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_87,code=sm_87")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=sm_89")
-  if(CUDA_VERSION VERSION_LESS "13.0")
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_101,code=sm_101")
-  else()  # CUDA 13.0 renamed SM101 to SM110
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_110,code=sm_110")
+  if(CUDA_VERSION VERSION_GREATER_EQUAL "12.8")
+    if(CUDA_VERSION VERSION_LESS "13.0")
+      list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_101,code=sm_101")
+    else()  # CUDA 13.0 renamed SM101 to SM110
+      list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_110,code=sm_110")
+    endif()
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=compute_120")
+  else()
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=compute_89")
   endif()
-  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")
-  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=compute_120")
 
   cuda_add_library(${PROJECT_NAME}_cuda_lib SHARED
     lib/postprocess/postprocess_kernel.cu
+    lib/postprocess/detection3d_postprocess.cu
     lib/preprocess/preprocess_kernel.cu
   )
 
@@ -86,6 +92,7 @@ if(TRT_AVAIL AND CUDA_AVAIL)
 
   ament_auto_add_library(${PROJECT_NAME}_lib SHARED
     lib/ptv3_trt.cpp
+    lib/ros_utils.cpp
   )
 
   target_compile_definitions(${PROJECT_NAME}_lib PRIVATE
@@ -106,7 +113,7 @@ if(TRT_AVAIL AND CUDA_AVAIL)
   target_include_directories(${PROJECT_NAME}_lib
     SYSTEM PUBLIC
     ${CUDA_INCLUDE_DIRS}
-    $(autoware_point_types_INCLUDE_DIRS)
+    ${autoware_point_types_INCLUDE_DIRS}
   )
 
   ament_auto_add_library(${PROJECT_NAME}_component SHARED
@@ -126,6 +133,24 @@ if(TRT_AVAIL AND CUDA_AVAIL)
     TARGETS ${PROJECT_NAME}_cuda_lib
     DESTINATION lib
   )
+
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+
+    ament_add_gtest(serialized_pooling_metadata_test
+      test/serialized_pooling_metadata_test.cpp
+    )
+    if(TARGET serialized_pooling_metadata_test)
+      target_link_libraries(serialized_pooling_metadata_test
+        CUDA::cudart
+        ${PROJECT_NAME}_cuda_lib
+      )
+      target_include_directories(serialized_pooling_metadata_test PRIVATE
+        include
+        ${CUDA_INCLUDE_DIRS}
+      )
+    endif()
+  endif()
 
   ament_auto_package(
     INSTALL_TO_SHARE

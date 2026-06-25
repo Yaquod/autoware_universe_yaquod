@@ -81,16 +81,21 @@ if(TRT_AVAIL AND CUDA_AVAIL)
   # but nvcc assume comma separated as argument of `-Xcompiler` option).
   # That is why `cuda_add_library` is used here.
 
+  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_75,code=sm_75")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_86,code=sm_86")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_87,code=sm_87")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=sm_89")
-  if(CUDA_VERSION VERSION_LESS "13.0")
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_101,code=sm_101")
-  else()  # CUDA 13.0 renamed SM101 to SM110
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_110,code=sm_110")
+  if(CUDA_VERSION VERSION_GREATER_EQUAL "12.8")
+    if(CUDA_VERSION VERSION_LESS "13.0")
+      list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_101,code=sm_101")
+    else()  # CUDA 13.0 renamed SM101 to SM110
+      list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_110,code=sm_110")
+    endif()
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=compute_120")
+  else()
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=compute_89")
   endif()
-  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")
-  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=compute_120")
 
   cuda_add_library(${PROJECT_NAME}_gpu_preprocess
     SHARED
@@ -145,6 +150,7 @@ rclcpp_components_register_node(yolox_single_image_inference_node
 
 ament_auto_add_library(${PROJECT_NAME}_node SHARED
   src/tensorrt_yolox_node.cpp
+  src/tensorrt_yolox_detector.cpp
 )
 
 ament_target_dependencies(${PROJECT_NAME}_node
@@ -167,9 +173,30 @@ rclcpp_components_register_node(${PROJECT_NAME}_node
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+  ament_auto_add_gtest(test_label
+    test/test_label.cpp
+  )
+
+  # Characterization test that drives the node end-to-end through ROS topics. It needs an NVIDIA
+  # GPU, TensorRT and the ONNX model, so it is gated here and additionally self-skips at runtime
+  # (GTEST_SKIP) when the GPU or model is unavailable. The TIMEOUT covers the first-time TensorRT
+  # engine build (a few minutes) on machines without a cached engine.
+  if(TRT_AVAIL AND CUDA_AVAIL)
+    ament_auto_add_gtest(test_tensorrt_yolox_node
+      test/test_tensorrt_yolox_node.cpp
+      TIMEOUT 600
+    )
+    target_link_libraries(test_tensorrt_yolox_node
+      ${PROJECT_NAME}
+      ${PROJECT_NAME}_node
+      ${OpenCV_LIBRARIES}
+    )
+    install(FILES test/test_image.jpg DESTINATION share/${PROJECT_NAME}/test)
+  endif()
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE
   launch
   config
+  test/test_label_data
 )

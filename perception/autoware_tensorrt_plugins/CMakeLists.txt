@@ -85,16 +85,21 @@ if(TRT_AVAIL AND CUDA_AVAIL AND SPCONV_AVAIL)
 
   # cSpell:ignore expt
   list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr -diag-suppress 1675 --extended-lambda")
+  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_75,code=sm_75")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_86,code=sm_86")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_87,code=sm_87")
   list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=sm_89")
-  if(CUDA_VERSION VERSION_LESS "13.0")
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_101,code=sm_101")
-  else()  # CUDA 13.0 renamed SM101 to SM110
-    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_110,code=sm_110")
+  if(CUDA_VERSION VERSION_GREATER_EQUAL "12.8")
+    if(CUDA_VERSION VERSION_LESS "13.0")
+      list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_101,code=sm_101")
+    else()  # CUDA 13.0 renamed SM101 to SM110
+      list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_110,code=sm_110")
+    endif()
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=compute_120")
+  else()
+    list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_89,code=compute_89")
   endif()
-  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=sm_120")
-  list(APPEND CUDA_NVCC_FLAGS "-gencode arch=compute_120,code=compute_120")
 
   cuda_add_library(cuda_ops SHARED
     src/argsort_ops/argsort.cu
@@ -141,6 +146,29 @@ if(TRT_AVAIL AND CUDA_AVAIL AND SPCONV_AVAIL)
       cuda_ops
       spconv::spconv
   )
+
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+
+    ament_add_gtest(reference_kernels_test
+      test/argsort_kernel_test.cpp
+      test/segment_csr_kernel_test.cpp
+      test/unique_kernel_test.cpp
+    )
+    if(TARGET reference_kernels_test)
+      target_link_libraries(reference_kernels_test
+        CUDA::cudart
+        cuda_ops
+      )
+      target_include_directories(reference_kernels_test PRIVATE
+        include
+        test
+        ${autoware_cuda_utils_INCLUDE_DIRS}
+        ${CUDA_INCLUDE_DIRS}
+      )
+      target_compile_definitions(reference_kernels_test PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    endif()
+  endif()
 
   install(
     TARGETS ${PROJECT_NAME}

@@ -26,10 +26,9 @@
 
 #include <autoware_perception_msgs/msg/detected_objects.hpp>
 #include <autoware_perception_msgs/msg/tracked_objects.hpp>
+#include <autoware_simulation_msgs/msg/simulated_object.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#include <tier4_perception_msgs/msg/detected_objects_with_feature.hpp>
-#include <tier4_simulation_msgs/msg/dummy_object.hpp>
 #include <unique_identifier_msgs/msg/uuid.hpp>
 
 #include <pcl/common/distances.h>
@@ -44,9 +43,9 @@
 
 namespace autoware::dummy_perception_publisher
 {
+using autoware_simulation_msgs::msg::SimulatedObject;
 using geometry_msgs::msg::PoseWithCovariance;
 using geometry_msgs::msg::TwistWithCovariance;
-using tier4_simulation_msgs::msg::DummyObject;
 
 class PointCloudCreator
 {
@@ -97,11 +96,10 @@ class DummyPerceptionPublisherNode : public rclcpp::Node
 {
 private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
-  rclcpp::Publisher<tier4_perception_msgs::msg::DetectedObjectsWithFeature>::SharedPtr
-    detected_object_with_feature_pub_;
+  rclcpp::Publisher<autoware_perception_msgs::msg::DetectedObjects>::SharedPtr detected_object_pub_;
   rclcpp::Publisher<autoware_perception_msgs::msg::TrackedObjects>::SharedPtr
     ground_truth_objects_pub_;
-  rclcpp::Subscription<DummyObject>::SharedPtr object_sub_;
+  rclcpp::Subscription<SimulatedObject>::SharedPtr object_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -109,9 +107,7 @@ private:
   double visible_range_;
   double detection_successful_rate_;
   bool enable_ray_tracing_;
-  bool use_object_recognition_;
   bool use_base_link_z_;
-  bool publish_ground_truth_objects_;
   std::unique_ptr<PointCloudCreator> pointcloud_creator_;
   // dummy object movement plugins
   std::vector<std::shared_ptr<pluginlib::DummyObjectMovementBasePlugin>> movement_plugins_;
@@ -119,7 +115,7 @@ private:
   std::mt19937 random_generator_;
 
   void timerCallback();
-  void objectCallback(const DummyObject::ConstSharedPtr msg);
+  void objectCallback(const SimulatedObject::ConstSharedPtr msg);
 
   pcl::PointCloud<autoware::point_types::PointXYZIRC> convertPointCloudXYZtoXYZIRC(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr & input_cloud) const;

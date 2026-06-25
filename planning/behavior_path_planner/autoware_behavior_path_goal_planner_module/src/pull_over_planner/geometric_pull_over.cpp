@@ -18,9 +18,6 @@
 #include "autoware/behavior_path_planner_common/utils/drivable_area_expansion/static_drivable_area.hpp"
 #include "autoware/behavior_path_planner_common/utils/path_utils.hpp"
 
-#include <autoware_lanelet2_extension/utility/query.hpp>
-#include <autoware_lanelet2_extension/utility/utilities.hpp>
-
 #include <memory>
 #include <vector>
 
@@ -83,7 +80,8 @@ std::optional<PullOverPath> GeometricPullOver::plan(
   // todo: Implement lane departure detection that does not depend on the footprint
   const auto resampled_arc_path =
     utils::resamplePathWithSpline(arc_path, parameters_.center_line_path_interval / 2);
-  if (boundary_departure_checker_.checkPathWillLeaveLane({departure_check_lane}, arc_path))
+  if (boundary_departure_checker_.checkPathWillLeaveLane(
+        {departure_check_lane}, resampled_arc_path))
     return {};
 
   auto pull_over_path_opt = PullOverPath::create(

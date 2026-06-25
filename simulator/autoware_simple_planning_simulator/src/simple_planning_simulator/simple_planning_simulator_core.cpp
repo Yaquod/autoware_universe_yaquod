@@ -171,7 +171,7 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   pub_imu_ = create_publisher<Imu>("output/imu", QoS{1});
   pub_tf_ = create_publisher<tf2_msgs::msg::TFMessage>("/tf", QoS{1});
   pub_actuation_status_ =
-    create_publisher<ActuationStatusStamped>("output/actuation_status", QoS{1});
+    create_publisher<ActuationReportStamped>("output/actuation_status", QoS{1});
   if (enable_pub_steer_) {
     pub_steer_ = create_publisher<SteeringReport>("output/steering", QoS{1});
   }
@@ -184,12 +184,6 @@ SimplePlanningSimulator::SimplePlanningSimulator(const rclcpp::NodeOptions & opt
   on_timer_ = rclcpp::create_timer(
     this, get_clock(), std::chrono::milliseconds(timer_sampling_time_ms_),
     std::bind(&SimplePlanningSimulator::on_timer, this));
-
-  tier4_api_utils::ServiceProxyNodeInterface proxy(this);
-  group_api_service_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  srv_set_pose_ = proxy.create_service<tier4_external_api_msgs::srv::InitializePose>(
-    "/api/simulator/set/pose", std::bind(&SimplePlanningSimulator::on_set_pose, this, _1, _2),
-    rmw_qos_profile_services_default, group_api_service_);
 
   // set vehicle model type
   initialize_vehicle_model(vehicle_model_type_str);
@@ -567,19 +561,6 @@ void SimplePlanningSimulator::on_initialtwist(const TwistStamped::ConstSharedPtr
   initial_twist_ = *msg;
 }
 
-void SimplePlanningSimulator::on_set_pose(
-  const InitializePose::Request::ConstSharedPtr request,
-  const InitializePose::Response::SharedPtr response)
-{
-  // save initial pose
-  Twist initial_twist;
-  PoseStamped initial_pose;
-  initial_pose.header = request->pose.header;
-  initial_pose.pose = request->pose.pose.pose;
-  set_initial_state_with_transform(initial_pose, initial_twist);
-  response->status = tier4_api_utils::response_success();
-}
-
 void SimplePlanningSimulator::set_input(const InputCommand & cmd, const double acc_by_slope)
 {
   std::visit(
@@ -597,9 +578,9 @@ void SimplePlanningSimulator::set_input(const InputCommand & cmd, const double a
 void SimplePlanningSimulator::set_input(
   const ActuationCommandStamped & cmd, const double acc_by_slope)
 {
-  const auto accel = cmd.actuation.accel_cmd;
-  const auto brake = cmd.actuation.brake_cmd;
-  const auto steer = cmd.actuation.steer_cmd;
+  const auto accel = cmd.actuation_command.accel_cmd;
+  const auto brake = cmd.actuation_command.brake_cmd;
+  const auto steer = cmd.actuation_command.steer_cmd;
   const auto gear = vehicle_model_ptr_->getGear();
 
   Eigen::VectorXd input(vehicle_model_ptr_->getDimU());
